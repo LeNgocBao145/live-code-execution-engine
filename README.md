@@ -66,9 +66,9 @@ A robust Node.js backend for executing code in multiple programming languages wi
          v                                       |
     +-------------+                    +--------------------+
     |   Redis     |                    |   PostgreSQL       |
-    |  Queue Store|                    |   live_code_       |
-    |             |                    |   execution        |
-    +-------------+                    +--------------------+
+    |  Queue Store|                    |   livecoding       |
+    |             |                    +--------------------+
+    +-------------+                    
          ^
          | Worker Process
          | (codeExecutionWorker.js)
@@ -595,15 +595,7 @@ Optimized for **reliability** over speed:
 - Retry logic handles transient failures
 - Database persistence ensures execution results survive crashes
 
-### Production Readiness Gaps
 
-1. **Authentication**: No user authentication or authorization
-2. **Advanced Sandboxing**: Child process, not Docker isolation
-3. **Metrics**: No Prometheus/Grafana integration
-4. **Log Aggregation**: Stdout only, no centralized logging
-5. **Secret Management**: Environment variables only
-
----
 
 ## Performance
 
@@ -671,7 +663,7 @@ redis-cli
 
 ### Database
 ```bash
-psql -U postgres -h localhost -d live_code_execution
+psql -U postgres -h localhost -d livecoding
 SELECT COUNT(*) FROM executions WHERE status = 'QUEUED';
 ```
 
@@ -684,18 +676,365 @@ docker-compose logs -f worker
 
 ---
 
-## Future Improvements
+## Production Optimization Roadmap
 
-1. **Authentication** - JWT, per-user rate limits
-2. **Persistent Audit Logs** - Store all events in database
-3. **Advanced Sandboxing** - Docker per execution, filesystem restrictions
-4. **WebSocket** - Real-time execution streaming
-5. **Metrics** - Prometheus, Grafana dashboards
-6. **Advanced Features** - Multiple files, stdin, custom libraries
-7. **SDK/CLI** - Client library, command-line tool
-8. **Performance** - Code caching, compilation caching
-9. **Better Recovery** - Dead letter queue, manual retries, webhooks
-10. **Load Testing** - Artillery, k6, chaos testing
+### 1. Code Execution Isolation (High Priority)
+
+**Current State**: Execution is conceptually isolated at worker level via OS processes.
+
+**Limitations**:
+- No strong sandboxing against file system access
+- Process escape vulnerabilities possible
+- Malicious system calls not restricted
+
+**Production Improvements**:
+- Replace process-based execution with container-based isolation:
+  - **Docker**: Standard containerization with resource limits
+  - **Firecracker**: Lightweight microVMs for secure isolation
+  - **gVisor**: User-space kernel providing additional isolation
+- Apply security hardening:
+  - **Seccomp** profiles to restrict system calls
+  - **Read-only filesystem** to prevent modifications
+  - **Network isolation** to prevent outbound connections
+
+---
+
+### 2. Execution Result Storage Management
+
+**Current State**: stdout and stderr stored directly in PostgreSQL as TEXT.
+
+**Limitations**:
+- Large outputs increase database size
+- Query performance degradation
+- Memory issues when fetching large results
+
+**Production Improvements**:
+- Enforce configurable output size limits (e.g., max 1MB per execution)
+- Store large outputs in external object storage (e.g., AWS S3, MinIO)
+- Persist only references (URLs/object keys) in database
+- Implement streaming for large result retrieval
+
+---
+
+### 3. Idempotency Guarantees
+
+**Current State**: Each POST /code-sessions/{id}/run creates new execution. Claim of idempotency via UUID, but no explicit deduplication.
+
+**Limitations**:
+- Rapid repeated requests may enqueue duplicate executions
+- Network retries can cause unintended duplicate runs
+- No client-side request deduplication
+
+**Production Improvements**:
+- Introduce **idempotency keys** per execution request
+- Reject or deduplicate requests with same idempotency key within 24-hour window
+- Return cached result for duplicate requests
+- Document idempotency key header requirement in API
+
+---
+
+### 4. Rate Limiting & Abuse Protection (Enhanced)
+
+**Current State**: Basic rate limiting (10 executions/min per session, 5 consecutive failures block).
+
+**Limitations**:
+- Vulnerable to execution spamming from multiple sessions
+- No per-user limits (if authentication added)
+- No resource quotas across sessions
+- DOS attack vectors possible
+
+**Production Improvements**:
+- Apply **per-session rate limiting** (current: 10/min)
+- Add **per-user rate limiting** once authentication implemented
+- Implement **resource quotas**:
+  - Max CPU time per user per day
+  - Max storage quota for results
+  - Max concurrent executions
+- Enforce **cooldown periods** between rapid executions
+- Add **IP-based rate limiting** to prevent distributed attacks
+- Implement **adaptive rate limiting** based on system load
+
+---
+
+### 5. Autosave Optimization
+
+**Current State**: Autosave API (PATCH /code-sessions/{id}) writes directly to PostgreSQL.
+
+**Limitations**:
+- High-frequency autosave calls increase write load
+- Database contention during peak usage
+- Inefficient for real-time collaborative editing
+
+**Production Improvements**:
+- **Cache intermediate states in Redis** with expiration (e.g., 10 min)
+- **Debounce client-side autosave** (e.g., 5-second intervals)
+- **Batch writes** to PostgreSQL periodically (every 30-60s)
+- Implement **conflict resolution** for concurrent edits
+- Use Redis **WATCH** for optimistic locking
+
+---
+
+### 6. Real-Time Execution Updates (Replace Polling)
+
+**Current State**: Clients poll GET /executions/{id} to retrieve execution status.
+
+**Limitations**:
+- Inefficient for high concurrency
+- Generates redundant requests during execution
+- Higher latency for result delivery
+- Increases server load
+
+**Production Improvements**:
+- **WebSocket connections** for persistent bidirectional communication
+- **Server-Sent Events (SSE)** as polling alternative
+- **Push execution status updates** in real time
+  - QUEUED → RUNNING → COMPLETED
+  - Stream stdout/stderr chunks as they arrive
+- Implement automatic reconnection with backoff
+- Support subscription to multiple execution streams
+
+---
+
+### 7. Failure Classification (Finer-Grained Error Codes)
+
+**Current State**: Failures broadly categorized as FAILED, TIMEOUT.
+
+**Limitations**:
+- No distinction between:
+  - Compilation errors vs runtime errors
+  - User code errors vs system errors
+  - Worker crashes vs timeouts
+  - Out-of-memory vs timeout
+
+**Production Improvements**:
+- Introduce **error code categories**:
+  - **Syntax Error** (E001): Code failed to compile/parse
+  - **Runtime Error** (E002): Code crashed during execution
+  - **Memory Limit** (E003): Exceeded memory allocation
+  - **Time Limit** (E004): Exceeded execution time
+  - **System Error** (E005): Worker/infrastructure failure
+  - **Unsafe Code** (E006): Blocked by safety rules
+- Standardize error messages with structured format:
+  ```json
+  {
+    "error_code": "E002",
+    "error_type": "RuntimeError",
+    "message": "TypeError: Cannot read property 'x' of undefined",
+    "stack_trace": "..."
+  }
+  ```
+
+---
+
+### 8. Dead Letter Queue (DLQ) Implementation
+
+**Current State**: Failed jobs remain in main queue after retries; status updated in DB.
+
+**Limitations**:
+- Difficult to inspect persistent failures
+- Challenging to reprocess failed executions
+- Hard to analyze systemic issues
+- No separate visibility for permanently failed jobs
+
+**Production Improvements**:
+- Configure **Dead Letter Queue** in BullMQ
+- Automatically move permanently failed jobs (after 3 retries) to DLQ
+- Implement **DLQ monitoring and alerting**:
+  - Alert when DLQ depth exceeds threshold
+  - Dashboard visibility for failed job analysis
+- Enable **manual replay** of failed executions:
+  - API endpoint to requeue from DLQ
+  - Admin panel for batch reprocessing
+- Implement **DLQ retention** policy (keep for 30 days)
+
+---
+
+### 9. Worker Heartbeat Monitoring
+
+**Current State**: Worker availability assumed based on job completion.
+
+**Limitations**:
+- Worker crashes leave executions stuck in RUNNING state
+- Manual cleanup required for stale executions
+- No automatic failure detection
+- Difficult to diagnose worker health
+
+**Production Improvements**:
+- Implement **worker heartbeat mechanism**:
+  - Worker sends heartbeat to Redis every 10 seconds
+  - Heartbeat includes worker ID, queue status, memory usage
+- Implement **heartbeat timeout detection**:
+  - Mark workers as DEAD if no heartbeat for 30 seconds
+  - Automatically mark RUNNING executions as FAILED if worker dies
+- Add **worker health monitoring**:
+  - Alert if heartbeat failure detected
+  - Track worker uptime and restart frequency
+  - Dashboard for worker status visualization
+- Implement **graceful worker shutdown**:
+  - Complete current job before stopping
+  - Return incomplete jobs to queue
+
+---
+
+### 10. Worker Auto-Scaling
+
+**Current State**: Worker scaling is manual or static.
+
+**Limitations**:
+- Does not adapt to queue backlog spikes
+- Cannot handle traffic bursts efficiently
+- Requires manual intervention to scale up/down
+
+**Production Improvements**:
+- Implement **horizontal auto-scaling of workers**:
+  - Scale based on **queue depth**: Add worker if jobs waiting > threshold
+  - Scale based on **job processing time**: Add worker if avg time exceeds limit
+  - Scale based on **CPU usage**: Add worker if system CPU > 80%
+- Use Kubernetes or container orchestration:
+  - Deploy workers as Kubernetes Deployments
+  - Use Horizontal Pod Autoscaler (HPA)
+- Implement **scaling policies**:
+  - Min workers: 2
+  - Max workers: 20
+  - Scale up by 1 worker if queue depth > 50 jobs
+  - Scale down by 1 worker if queue empty for 5 minutes
+
+---
+
+### 11. Enhanced Execution Metrics
+
+**Current State**: Execution time measured at application level only.
+
+**Limitations**:
+- Does not capture CPU vs wall-clock time
+- Context switching overhead not tracked
+- Missing memory peak usage
+- I/O metrics not available
+
+**Production Improvements**:
+- Use **OS-level or container-level metrics**:
+  - **CPU time**: User + system time
+  - **Memory peak**: Max RSS during execution
+  - **I/O metrics**: Bytes read/written
+  - **Context switches**: Voluntary + involuntary
+- Collect metrics at:
+  - Application level (process-level)
+  - Container level (if using Docker)
+  - System level (via /proc on Linux)
+- Store detailed metrics in time-series database:
+  - InfluxDB or Prometheus
+- Return metrics in execution response:
+  ```json
+  {
+    "execution_time_ms": 150,
+    "cpu_time_ms": 145,
+    "wall_clock_ms": 150,
+    "memory_peak_mb": 45,
+    "io_read_bytes": 1024,
+    "io_write_bytes": 512
+  }
+  ```
+
+---
+
+### 12. Redis High Availability
+
+**Current State**: Redis used for queue without replication.
+
+**Limitations**:
+- Redis downtime causes execution queue unavailability
+- Job loss if Redis crashes
+- No automatic failover
+- Single point of failure
+
+**Production Improvements**:
+- Deploy **Redis replication**:
+  - Master-slave setup with automatic failover
+  - Or use **Redis Sentinel** for automatic failover (3+ sentinels)
+- Enable **Redis persistence**:
+  - RDB snapshots (periodic)
+  - AOF (Append-Only File) for durability
+- Implement **Redis Cluster** for horizontal scaling:
+  - 6+ nodes for HA (3 masters, 3 replicas)
+  - Automatic sharding of queue data
+- Add **connection pooling** with retry logic
+- Implement **circuit breaker** for Redis failures
+
+---
+
+### 13. Multi-Language Runtime Optimization
+
+**Current State**: Language support is generic and uniform.
+
+**Limitations**:
+- High cold start latency (first execution of language)
+- No pre-warmed runtimes
+- Language-specific optimizations missing
+- Each language pays startup cost
+
+**Production Improvements**:
+- **Pre-build language-specific execution environments**:
+  - Cache Docker images with runtimes pre-installed
+  - Cache compiled language tools (e.g., Go toolchain)
+- Implement **runtime warm-up**:
+  - Keep a pool of pre-started containers for each language
+  - Reuse containers for multiple executions
+- Add **language-specific optimizations**:
+  - Node.js: Pre-require common modules
+  - Python: Use PyPy or pre-compiled libraries
+  - Java: Shared JVM pool to avoid startup
+  - C++: Pre-compile standard headers
+- Track **cold vs warm start times** separately
+- Implement **custom templates** with pre-loaded libraries
+
+---
+
+### 14. Structured Logging & Observability
+
+**Current State**: Execution lifecycle logged at high level to stdout.
+
+**Limitations**:
+- No distributed tracing
+- Non-structured logs hard to parse
+- No metrics dashboards
+- Difficult to diagnose issues in production
+
+**Production Improvements**:
+- **Add structured logging**:
+  - JSON-formatted logs with consistent schema
+  - Log levels: DEBUG, INFO, WARN, ERROR
+  - Include execution ID, session ID, worker ID in every log
+- **Implement distributed tracing**:
+  - Use OpenTelemetry for trace collection
+  - Track request flow: API → Queue → Worker → DB
+  - Export traces to Jaeger or Zipkin
+- **Collect Prometheus metrics**:
+  - Execution duration histogram
+  - Queue depth gauge
+  - Success/failure rate counters
+  - Worker resource usage
+- **Centralized logging**:
+  - Stream logs to ELK (Elasticsearch-Logstash-Kibana)
+  - Or Loki + Grafana for log aggregation
+  - Enable full-text search and filtering
+- **Create observability dashboards**:
+  - Grafana dashboard for metrics
+  - Execution timeline view
+  - Worker health status
+  - Queue backlog trends
+
+---
+
+## Future Feature Improvements
+
+1. **Authentication & Authorization** - JWT, per-user rate limits, role-based access
+2. **Persistent Audit Logs** - Store all events in database for compliance
+3. **Persistent Retry Tracking** - Query retry history from DB
+4. **Advanced Features** - Multiple files, stdin, custom libraries
+5. **SDK/CLI** - Client library, command-line tool
+6. **Webhooks** - Notify external systems on execution completion
+7. **Load Testing** - Artillery, k6, chaos testing
+8. **GraphQL API** - Alternative to REST for flexible queries
 
 ---
 
