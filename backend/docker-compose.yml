@@ -1,0 +1,106 @@
+version: '3.8'
+
+services:
+  postgres:
+    image: postgres:16-alpine
+    container_name: live-code-postgres
+    environment:
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: postgres
+      POSTGRES_DB: livecoding
+    ports:
+      - "5432:5432"
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+      - ./src/libs/schema.sql:/docker-entrypoint-initdb.d/01-schema.sql
+    networks:
+      - live-code-network
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  redis:
+    image: redis:7-alpine
+    container_name: live-code-redis
+    ports:
+      - "6379:6379"
+    volumes:
+      - redis_data:/data
+    networks:
+      - live-code-network
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  api:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: live-code-api
+    environment:
+      PORT: 3000
+      NODE_ENV: production
+      PG_HOST: postgres
+      PG_PORT: 5432
+      PG_DATABASE: livecoding
+      PG_USER: postgres
+      PG_PASSWORD: postgres
+      PG_SSL: false
+      REDIS_HOST: redis
+      REDIS_PORT: 6379
+      DEFAULT_TIME_LIMIT_MS: 5000
+      DEFAULT_MEMORY_MB: 256
+      MAX_CONCURRENT_EXECUTIONS: 10
+    ports:
+      - "3000:3000"
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    networks:
+      - live-code-network
+    volumes:
+      - ./src:/app/src
+    command: npm run dev
+
+  worker:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: live-code-worker
+    environment:
+      NODE_ENV: production
+      PG_HOST: postgres
+      PG_PORT: 5432
+      PG_DATABASE: livecoding
+      PG_USER: postgres
+      PG_PASSWORD: postgres
+      PG_SSL: false
+      REDIS_HOST: redis
+      REDIS_PORT: 6379
+      DEFAULT_TIME_LIMIT_MS: 5000
+      DEFAULT_MEMORY_MB: 256
+      MAX_CONCURRENT_EXECUTIONS: 10
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    networks:
+      - live-code-network
+    volumes:
+      - ./src:/app/src
+    command: npm run worker
+
+volumes:
+  postgres_data:
+  redis_data:
+
+networks:
+  live-code-network:
+    driver: bridge
