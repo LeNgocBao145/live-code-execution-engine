@@ -66,15 +66,24 @@ export async function runCode(req, res, next) {
   try {
     const { session_id } = req.params;
 
+    // Fetch session with language to get per-language default limits
+    const session = await SessionService.getSessionWithLimits(session_id);
+
     const execution = await ExecutionService.submitExecution(
       session_id,
-      parseInt(process.env.DEFAULT_TIME_LIMIT_MS || 5000),
-      parseInt(process.env.DEFAULT_MEMORY_MB || 256)
+      session.default_time_limit_ms || parseInt(process.env.DEFAULT_TIME_LIMIT_MS || 5000),
+      session.default_memory_mb || parseInt(process.env.DEFAULT_MEMORY_MB || 256)
     );
 
     return res.status(202).json(execution);
   } catch (error) {
     console.error('[Controller] Run code error:', error);
+    if (error.status === 429) {
+      return res.status(429).json({
+        error: error.message,
+        retryAfter: error.retryAfter
+      });
+    }
     return res.status(400).json({ error: error.message });
   }
 }

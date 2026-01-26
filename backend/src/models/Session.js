@@ -11,7 +11,8 @@ export class Session {
 
   static async findWithLanguage(id) {
     const res = await query(
-      `SELECT s.*, l.name as language_name, l.template_code, l.runtime, l.version, l.file_name
+      `SELECT s.*, l.name as language_name, l.template_code, l.runtime, l.version, l.file_name,
+              l.default_time_limit_ms, l.default_memory_mb
        FROM sessions s
        JOIN languages l ON s.language_id = l.id
        WHERE s.id = $1`,

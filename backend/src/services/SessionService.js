@@ -19,7 +19,7 @@ export class SessionService {
 
     return {
       session_id: session.id,
-      status: session.status,      
+      status: session.status,
     };
   }
 
@@ -35,7 +35,7 @@ export class SessionService {
 
     return {
       session_id: updated.id,
-      status: updated.status,      
+      status: updated.status,
     };
   }
 
@@ -55,6 +55,25 @@ export class SessionService {
       version: session.version,
       created_at: session.created_at,
       updated_at: session.updated_at,
+    };
+  }
+
+  static async getSessionWithLimits(sessionId) {
+    const session = await Session.findWithLanguage(sessionId);
+    if (!session) {
+      throw new Error(`Session not found: ${sessionId}`);
+    }
+
+    if (session.status !== 'ACTIVE') {
+      throw new Error(`Session is not active: ${sessionId}`);
+    }
+
+    return {
+      session_id: session.id,
+      status: session.status,
+      language_id: session.language_id,
+      default_time_limit_ms: session.default_time_limit_ms,
+      default_memory_mb: session.default_memory_mb,
     };
   }
 
